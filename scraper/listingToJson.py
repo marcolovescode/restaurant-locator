@@ -1,4 +1,22 @@
-# open file, loop line-by-line
+####################################################################################################
+# BLOG Parser and Scraper
+# Copyright (c) 2019-2020 Marco Zafra
+# 
+# Program flow:
+# 1. Parse a master list of expected blog posts, listed by place name
+# 2. Retrieve direct URLs to blog posts by searching Google
+# 3. Retrieve the blog post and scrape its content
+#
+# TODO: Rely on the blog API to expose all places instead of relying on a
+# prewritten master list.
+#
+# The program flow is such because the blog author maintains a PDF of
+# the restaurants they have reviewed. For my convenience, I used the PDF
+# to write a master list of places in Markdown format.
+#
+# NOTE: The blog name is redacted for now with strings 'BLOG', 'blog', 'bl_', and 'example.com'
+# pending author's permission to use their content
+####################################################################################################
 
 import argparse
 from slugify import slugify
@@ -31,7 +49,7 @@ class BLOGParser(object):
         self._clear_documents()
 
     ################################################################################################
-    # STATE
+    # RESET MASTER LIST PARSER
     ################################################################################################
 
     def _reset_state(self):
@@ -52,7 +70,7 @@ class BLOGParser(object):
         self.locations = [] # list of document dicts
 
     ################################################################################################
-    # UTILITY FUNCS
+    # UTILITY METHODS
     ################################################################################################
 
     def _rate_limiter_callback(self, until):
@@ -89,8 +107,84 @@ class BLOGParser(object):
         return dt_out
 
     ################################################################################################
-    # LINE BY LINE PARSING
+    # MASTER LIST PARSER LOGIC
     ################################################################################################
+
+    def parse(self):
+        with open(self._raw_file_uri) as f:
+            for line in f:
+                # ignore one-hash lines ('# Restaurants') because
+                # they are a document header
+                if line.startswith('## '):
+                    self._end_state()
+                    self._state = 'cuisine'
+                elif line.startswith('### '):
+                    self._end_state()
+                    self._state = 'location'
+
+                self._parse_line(line)
+            self._end_state()
+
+    def _parse_line(self, line: str):
+        # handle parsing for both cuisine and location states. They're mostly the same, except
+        # where noted.
+        #
+        # parse rules: we can't look forward or backward a line, just read the current line.
+        # a new substate is established while we already operate on the first line of that substate.
+
+        if self._substate == 'name':
+            if self._state == 'cuisine':
+                name_prefix = '## '
+            else:
+                name_prefix = '### '
+
+            # get entity name and generate slug
+            if line.startswith(name_prefix):
+                # location names are part of the raw locator ("### name, street address, city, phone number")
+                # so just get the beginning segment before the first comma
+                # then slice off the name_prefix, then trim whitespace
+                self._document['name'] = line.split(',', 1)[0][len(name_prefix):].strip()
+
+                # transform name to lower-dash-case and set that as slug
+                # this will be overwritten by a subsequent '* ' field line if one exists
+                # (e.g., "* slug: slug-name")
+                self._document['slug'] = slugify(self._document['name'])
+
+                # if location, also record the entire line as a raw locator
+                if self._state == 'location':
+                    self._document['rawContactPoint'] = line[len(name_prefix):].strip()
+            else:
+                if len(line.strip()) > 0:
+                    if line.startswith('* '):
+                        self._substate = 'fields'
+                    else:
+                        self._substate = 'description'
+        # fallthru because the current line may already be the start of a new substate
+
+        if self._substate == 'fields':
+            if line.startswith('* '):
+                # strip '* ' from line ([2:]), then split 'key: val', then trim whitespace from both segments
+                split_line = [segment.strip() for segment in line[2:].split(':', 1)]
+
+                # special case: value of 'cuisines' is a string array
+                if split_line[0] == 'cuisines':
+                    self._document[split_line[0]] = [segment.strip() for segment in split_line[1].split(',')]
+                # special case: if value is True or False, evaluate as boolean
+                elif split_line[1].lower() == 'true':
+                    self._document[split_line[0]] = True
+                elif split_line[1].lower() == 'false':
+                    self._document[split_line[0]] = False
+                else:
+                    self._document[split_line[0]] = split_line[1]
+            else:
+                if len(line.strip()) > 0:
+                    self._substate = 'description'
+        # fallthru again
+
+        # after '* ' field lines, record subsequent non-three-hash lines as description
+        if self._substate == 'description':
+            self._document.setdefault('description', '')
+            self._document['description'] += line # + '\n'
 
     def _end_state(self):
         # TODO fill in default missing fields
@@ -126,72 +220,6 @@ class BLOGParser(object):
         self._substate = 'name'
         self._document = {}
 
-    def _parse_line(self, line: str):
-        # handle parsing for both cuisine and location states. They're mostly the same, except
-        # where noted.
-        #
-        # parse rules: we can't look forward or backward a line, just read the current line.
-        # a new substate is established while we already operate on the first line of that substate.
-
-        if self._substate == 'name':
-            name_prefix = '## ' if self._state == 'cuisine' else '### '
-
-            # get entity name and generate slug
-            if line.startswith(name_prefix):
-                # location names are part of the raw locator ("### name, street address, city, phone number")
-                # so just get the beginning segment before the first comma
-                # then slice off the name_prefix, then trim whitespace
-                self._document['name'] = line.split(',', 1)[0][len(name_prefix):].strip()
-                self._document['slug'] = slugify(self._document['name'])
-
-                # if location, also record the entire line as a raw locator
-                if self._state == 'location':
-                    self._document['rawContactPoint'] = line[len(name_prefix):].strip()
-            else:
-                if len(line.strip()) > 0:
-                    if line.startswith('* '):
-                        self._substate = 'fields'
-                    else:
-                        self._substate = 'description'
-        # fallthru because the current line may already be the start of a new substate
-
-        if self._substate == 'fields':
-            if line.startswith('* '):
-                # strip '* ' from line ([2:]), then split 'key: val', then trim whitespace from both segments
-                split_line = [segment.strip() for segment in line[2:].split(':', 1)]
-
-                # special case: value of 'cuisines' is a string array
-                if split_line[0] == 'cuisines':
-                    self._document[split_line[0]] = [segment.strip() for segment in split_line[1].split(',')]
-                # special case: if value is True or False, evaluate as boolean
-                elif split_line[1].lower() == 'true':
-                    self._document[split_line[0]] = True
-                elif split_line[1].lower() == 'false':
-                    self._document[split_line[0]] = False
-                else:
-                    self._document[split_line[0]] = split_line[1]
-            else:
-                if len(line.strip()) > 0:
-                    self._substate = 'description'
-        # fallthru again
-
-        if self._substate == 'description':
-            self._document.setdefault('description', '')
-            self._document['description'] += line # + '\n'
-
-    def parse(self):
-        with open(self._raw_file_uri) as f:
-            for line in f:
-                if line.startswith('## '):
-                    self._end_state()
-                    self._state = 'cuisine'
-                elif line.startswith('### '):
-                    self._end_state()
-                    self._state = 'location'
-
-                self._parse_line(line)
-            self._end_state()
-
     ################################################################################################
     # BLOG Handling
     ################################################################################################
@@ -199,6 +227,7 @@ class BLOGParser(object):
     def find_blog(self, force: bool = False, check_duplicates: bool = True, use_abenassi: bool = False, use_manual: bool = False):
         rate_limiter = RateLimiter(max_calls=1, period=55, callback=self._rate_limiter_callback)
 
+        # page-scraping -- on each [ { location } ]
         for doc in self.locations:
             doc.setdefault('url', {})
 
@@ -207,6 +236,8 @@ class BLOGParser(object):
                 continue
 
             print('Location {}: Finding BLOG URL...'.format(doc['slug']))
+
+            # search google for "site:example.com {description}" (truncate to first paragraph)
 
             # strip markdown
             # fix broken UTF-8 with ftfy, or the mojibake â€“ throws off google
@@ -219,8 +250,7 @@ class BLOGParser(object):
             alt_search_text = 'site:example.com {}'.format(
                 unidecode(ftfy.fix_encoding(doc['name'])))
 
-            # search google for BLOG page
-
+            # set { url.blog } to first result that does NOT have /page/ in it
             def parse_results(results):
                 for result in results:
                     if use_manual:
@@ -260,6 +290,7 @@ class BLOGParser(object):
                         results = google.search(search_text, num_page)
                     else:
                         results = search(search_text, num_results=10)
+
             parse_results(results)
 
             # if no luck, try it again by searching just the name
@@ -340,7 +371,11 @@ class BLOGParser(object):
                 if 'yelp.' in elem['href']:
                     if force or 'yelp' not in doc['url']:
                         doc['url']['yelp'] = elem['href']
-                # store google map link for now
+                # ignore Google Plus
+                elif 'plus.google.' in elem['href']:
+                    pass
+                # TODO: ignore google map link in the future; grab from Yelp or geolocate ourselves
+                # for now, store google map link
                 elif 'google.' in elem['href'] and 'maps' in elem['href']:
                     if force or 'maps' not in doc['url']:
                         doc['url']['maps'] = elem['href']
@@ -365,7 +400,8 @@ class BLOGParser(object):
                     if force and found_href:
                         del doc['content']['a'][found_i]
                     if force or not found_href:
-                        # check for broken link
+                        # check for broken link (HTTP status)
+                        # TODO: Follow 3xx redirects and get actual URL
                         status = self._get_link_status(href)
                         doc['content']['a'].append({'name': elem.string, 'href': elem['href'], 'statusCode': status})
 
@@ -446,7 +482,6 @@ class BLOGParser(object):
         json.dump(self.cuisines, fp=open(cuisine_uri, 'w'))
         print('Exported cuisine output to "{}"'.format(cuisine_uri))
 
-
 def get_args():
     parser = argparse.ArgumentParser(description='Convert Markdown listing file to BLOG JSON documents')
     parser.add_argument('fileuri', type=str, help='Path to input text file')
@@ -458,7 +493,7 @@ def get_args():
     args = parser.parse_args()
     return args
 
-if __name__ == '__main__':
+def main():
     args = get_args()
 
     if args.load:
@@ -467,22 +502,12 @@ if __name__ == '__main__':
     else:
         bl_parser = BLOGParser(args)
 
-    for doc in bl_parser.locations:
-        if not 'content' in doc or not 'a' in doc['content']:
-            continue
-        remove = []
-        for i, entry in enumerate(doc['content']['a']):
-            if 'plus.google.' in entry['href']:
-                remove.append(i)
-        remove.sort(reverse=True)
-        for i in remove:
-            del doc['content']['a'][i]
-
-    if False:
-        bl_parser.parse()
-        bl_parser.find_blog(use_abenassi=args.abenassi, use_manual=args.manual)
-        bl_parser.download_blog()
-        bl_parser.scrape_blog()
+    # Parse master listing and retrieve content from BLOG
+    # TODO: Do not overwrite stored content if the remote content is not newer
+    bl_parser.parse()
+    bl_parser.find_blog(use_abenassi=args.abenassi, use_manual=args.manual)
+    bl_parser.download_blog()
+    bl_parser.scrape_blog()
 
     ##print('='*80+'\n'+'CUISINES'+'\n'+'='*80+'\n')
     ##pprint(bl_parser.cuisines)
@@ -493,37 +518,5 @@ if __name__ == '__main__':
     bl_parser.export()
     bl_parser.dump(args.out)
 
-# argParser: load listing text f ile
-
-# ignore one-hash lines (Restaurants)
-
-# on two-hash lines:
-#    * look for star line for slug.
-#        * if that exists, set current_slug = [slug:].
-#        * else, transform name to lower-dash-case and set that as current_slug
-#            * drop non-alphanumeric chars except -
-#            * use unidecode to convert all accented chars to nearest abc representation
-#    * if slug exists, don't store new json
-#    * record subsequent non-three-hash lines as description
-#    * store json to [ cuisines ]
-
-# on three-hash lines:
-#    * set three-hash-line as { rawContactPoint }
-#    * set current_slug as { tagSlugs }
-#    * set slug: three-hash-line truncated to first comma (restaurant name), transformed
-#    * look for star lines; set { name: value } (trim whitespace on both segments)
-#        * if tagSlugs, split by comma and append {tagSlugs: ['a', 'b', 'c']}
-#        * if value == 'true', set as boolean
-#    * record subsequent non-three-hash lines as { description: }
-#    * store json to [ locations ]
-
-# page-scraping -- on each [ { location } ]
-#    * rate limit to 1 second
-#    * search google for "site:example.com {description}" (truncate to first paragraph)
-#    * set { url.blog } to first result that does NOT have /page/ in it
-#    * on the BLOG URL, look for yelp link, set { url.yelp } to yelp link
-#    * ignore if url has "google" and "maps" (autogen from yelp data) UNLESS no yelp link is found, then { url.maps }
-#    * ignore "Metro Trip Planner"
-#    * for all other links, record { [ url.extras = { name: LinkText, locator: URL }]}
-#        * if link returns 404, record broken: true
-#        * if link is blog, record blog: true
+if __name__ == '__main__':
+    main()
